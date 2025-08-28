@@ -13,3 +13,12 @@ Thumbs.db
 # Build
 dist/
 build/
+
+# Session data
+.wwebjs_auth/
+
+# Log files
+*.log
+
+# Environment variables
+.env
