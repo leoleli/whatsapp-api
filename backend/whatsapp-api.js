@@ -5,33 +5,17 @@ const qrcode = require('qrcode');
 const bodyParser = require('body-parser');
 const cors = require('cors');
 const axios = require('axios');
+require('dotenv').config();
 
-const app = express();
-app.use(bodyParser.json());
-app.use(cors());
+// --- State Management ---
+const state = {
+    qrCode: null,
+    isReady: false,
+    webhookUrl: null,
+    lastMessages: [],
+};
 
-// TOKEN DE ACESSO (ajuste para seu uso)
-const VALID_TOKENS = ['ce72d1f374c8f0311f17d9765e246c24']; // Troque para seu token
-
-// Middleware de proteção
-function verifyToken(req, res, next) {
-    const token = req.headers['x-access-token'] || req.body.token;
-    if (!token || !VALID_TOKENS.includes(token)) {
-        return res.status(401).json({ error: 'Token inválido ou ausente' });
-    }
-    next();
-}
-
-// Endpoint de validação de token (login)
-app.post('/api/validate-token', (req, res) => {
-    const { token } = req.body;
-    if (VALID_TOKENS.includes(token)) {
-        res.json({ valid: true });
-    } else {
-        res.json({ valid: false });
-    }
-});
-
+// --- WhatsApp Client Initialization ---
 const client = new Client({
     authStrategy: new LocalAuth(),
     puppeteer: {
@@ -44,7 +28,7 @@ const client = new Client({
             '--no-first-run',
             '--no-zygote',
             '--disable-gpu'
-        ]
+        ],
     },
     takeoverOnConflict: true,
     takeoverTimeoutMs: 0,
@@ -52,104 +36,172 @@ const client = new Client({
     qrMaxRetries: 0,
 });
 
-let qrCode = null;
-let isReady = false;
-let webhookUrl = null;
-let lastMessages = [];
-
-client.on('qr', (qr) => {
-    console.log("Evento: qr gerado");
-    qrcode.toDataURL(qr, (err, url) => {
-        qrCode = url;
-        isReady = false;
+// --- WhatsApp Event Handlers ---
+function setupWhatsAppEvents() {
+    client.on('qr', (qr) => {
+        console.log("Evento: qr gerado");
+        qrcode.toDataURL(qr, (err, url) => {
+            if (err) {
+                console.error("Erro ao gerar QR code:", err);
+                return;
+            }
+            state.qrCode = url;
+            state.isReady = false;
+        });
     });
-});
 
-client.on('ready', () => {
-    console.log("Evento: ready - WhatsApp conectado!");
-    isReady = true;
-    qrCode = null;
-});
-
-client.on('authenticated', () => {
-    console.log("Evento: authenticated - WhatsApp autenticado!");
-});
-
-client.on('disconnected', (reason) => {
-    console.log("Evento: disconnected - WhatsApp desconectado!", reason);
-    isReady = false;
-    client.initialize();
-});
-
-client.on('message', async (msg) => {
-    lastMessages.push({
-        from: msg.from,
-        body: msg.body,
-        timestamp: Date.now()
+    client.on('ready', () => {
+        console.log("Evento: ready - WhatsApp conectado!");
+        state.isReady = true;
+        state.qrCode = null;
     });
-    if (webhookUrl) {
+
+    client.on('authenticated', () => {
+        console.log("Evento: authenticated - WhatsApp autenticado!");
+    });
+
+    client.on('disconnected', (reason) => {
+        console.log("Evento: disconnected - WhatsApp desconectado!", reason);
+        state.isReady = false;
+        // Tenta reinicializar o cliente
+        client.initialize().catch(err => console.error("Erro ao reinicializar o cliente:", err));
+    });
+
+    client.on('message', async (msg) => {
+        const messageData = {
+            from: msg.from,
+            body: msg.body,
+            timestamp: Date.now()
+        };
+        state.lastMessages.unshift(messageData); // Adiciona no início para manter as mais recentes
+        if (state.lastMessages.length > 50) { // Limita o número de mensagens armazenadas
+            state.lastMessages.pop();
+        }
+
+        if (state.webhookUrl) {
+            try {
+                await axios.post(state.webhookUrl, messageData);
+            } catch (e) {
+                console.error("Erro ao enviar webhook:", e.message);
+            }
+        }
+    });
+}
+
+// --- Express App Setup ---
+const app = express();
+app.use(bodyParser.json({ limit: '50mb' })); // Aumenta o limite para envio de mídia
+app.use(bodyParser.urlencoded({ extended: true, limit: '50mb' }));
+app.use(cors());
+
+// --- Security Middleware ---
+const VALID_TOKENS = process.env.VALID_TOKENS ? process.env.VALID_TOKENS.split(',') : [];
+
+function verifyToken(req, res, next) {
+    const token = req.headers['x-access-token'] || req.body.token;
+    if (!token || !VALID_TOKENS.includes(token)) {
+        console.warn(`Tentativa de acesso com token inválido: ${token}`);
+        return res.status(401).json({ error: 'Token inválido ou ausente' });
+    }
+    next();
+}
+
+// --- API Routes ---
+function setupRoutes() {
+    // Public routes
+    app.get('/api/status', (req, res) => {
+        res.json({
+            isReady: state.isReady,
+            qrCode: state.qrCode,
+            status: state.isReady ? 'authenticated' : (state.qrCode ? 'scan' : 'loading')
+        });
+    });
+
+    app.get('/api/qr', (req, res) => {
+        if (state.qrCode) {
+            res.json({ qr: state.qrCode, status: 'scan' });
+        } else if (state.isReady) {
+            res.json({ status: 'authenticated' });
+        } else {
+            res.json({ status: 'loading' });
+        }
+    });
+
+    app.post('/api/validate-token', (req, res) => {
+        const { token } = req.body;
+        res.json({ valid: VALID_TOKENS.includes(token) });
+    });
+
+    // Protected routes
+    const protectedRoutes = express.Router();
+    protectedRoutes.use(verifyToken);
+
+    protectedRoutes.post('/reconnect', (req, res) => {
+        console.log("Recebida solicitação para reconectar...");
+        client.initialize().catch(err => console.error("Erro ao tentar reconectar manualmente:", err));
+        res.json({ status: 'reconnecting' });
+    });
+
+    protectedRoutes.post('/message', async (req, res) => {
+        const { number, message } = req.body;
+        if (!state.isReady) return res.status(400).json({ error: 'WhatsApp não está pronto' });
+        if (!number || !message) return res.status(400).json({ error: 'Número e mensagem são obrigatórios' });
+
         try {
-            await axios.post(webhookUrl, { from: msg.from, body: msg.body });
-        } catch (e) {}
-    }
-});
+            const chatId = number.includes('@c.us') ? number : `${number}@c.us`;
+            await client.sendMessage(chatId, message);
+            res.json({ status: 'Mensagem enviada com sucesso' });
+        } catch (error) {
+            console.error("Erro ao enviar mensagem:", error);
+            res.status(500).json({ error: 'Falha ao enviar mensagem', details: error.message });
+        }
+    });
 
-client.initialize();
+    protectedRoutes.post('/media', async (req, res) => {
+        const { number, caption, mediaUrl } = req.body;
+        if (!state.isReady) return res.status(400).json({ error: 'WhatsApp não está pronto' });
+        if (!number || !mediaUrl) return res.status(400).json({ error: 'Número e URL da mídia são obrigatórios' });
 
-app.get('/api/qr', (req, res) => {
-    if (qrCode) res.json({ qr: qrCode, status: 'scan' });
-    else if (isReady) res.json({ status: 'authenticated' });
-    else res.json({ status: 'loading' });
-});
+        try {
+            const media = await MessageMedia.fromUrl(mediaUrl, { unsafeMime: true });
+            const chatId = number.includes('@c.us') ? number : `${number}@c.us`;
+            await client.sendMessage(chatId, media, { caption });
+            res.json({ status: 'Mídia enviada com sucesso' });
+        } catch (error) {
+            console.error("Erro ao enviar mídia:", error);
+            res.status(500).json({ error: 'Falha ao enviar mídia', details: error.message });
+        }
+    });
 
-app.get('/api/status', (req, res) => {
-    res.json({ isReady, qrCode });
-});
+    protectedRoutes.post('/webhook', (req, res) => {
+        const { url } = req.body;
+        if (!url) return res.status(400).json({ error: "URL do webhook é obrigatória" });
+        state.webhookUrl = url;
+        console.log(`Webhook registrado para: ${url}`);
+        res.json({ status: 'Webhook registrado com sucesso' });
+    });
 
-// Endpoints protegidos pelo token
-app.post('/api/reconnect', verifyToken, (req, res) => {
-    client.initialize();
-    res.json({ status: 'reconnecting' });
-});
+    protectedRoutes.get('/messages', (req, res) => {
+        res.json(state.lastMessages);
+    });
 
-app.post('/api/message', verifyToken, async (req, res) => {
-    const { number, message } = req.body;
-    if (!isReady) return res.status(400).json({ error: 'WhatsApp não está pronto' });
-    try {
-        const chatId = number.includes('@c.us') ? number : `${number}@c.us`;
-        await client.sendMessage(chatId, message);
-        res.json({ status: 'Mensagem enviada' });
-    } catch (error) {
-        res.status(500).json({ error: error.message });
-    }
-});
+    app.use('/api', protectedRoutes);
+}
 
-app.post('/api/media', verifyToken, async (req, res) => {
-    const { number, caption, mediaUrl } = req.body;
-    if (!isReady) return res.status(400).json({ error: 'WhatsApp não está pronto' });
-    try {
-        const chatId = number.includes('@c.us') ? number : `${number}@c.us`;
-        const response = await axios.get(mediaUrl, { responseType: 'arraybuffer' });
-        const mimeType = response.headers['content-type'];
-        const base64 = Buffer.from(response.data).toString('base64');
-        const media = new MessageMedia(mimeType, base64, 'media');
-        await client.sendMessage(chatId, media, { caption });
-        res.json({ status: 'Mídia enviada' });
-    } catch (error) {
-        res.status(500).json({ error: error.message });
-    }
-});
 
-app.post('/api/webhook', verifyToken, (req, res) => {
-    webhookUrl = req.body.url;
-    res.json({ status: 'Webhook registrado' });
-});
+// --- Server Start ---
+function startServer() {
+    setupWhatsAppEvents();
+    setupRoutes();
 
-app.get('/api/messages', verifyToken, (req, res) => {
-    res.json(lastMessages.slice(-20));
-});
+    client.initialize().catch(err => {
+        console.error("Erro fatal ao inicializar o cliente do WhatsApp:", err);
+    });
 
-const PORT = process.env.PORT || 3001;
-app.listen(PORT, () => {
-    console.log(`API WhatsApp rodando na porta ${PORT}`);
-});
+    const PORT = process.env.PORT || 3001;
+    app.listen(PORT, () => {
+        console.log(`API WhatsApp rodando na porta ${PORT}`);
+    });
+}
+
+startServer();
